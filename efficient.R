@@ -1,3 +1,73 @@
+# All together
+library("data.table")
+library("panelr")
+library("evd")
+library("tidyverse")
+library("numDeriv")
+library("doParallel")
+library("ucminf")
+library("optimx")
+library("spatstat")
+library("Brobdingnag")
+
+load("data_anubis.Rda")
+data = data_anubis
+data <- data.table(data)
+data = data[, list(id, age, choice_, choice_present, lwage, wage_scale, wage_, urban, g_, expe_, more_eighteen, more_twenty, expe_2, age_2, # utilities
+                   attrition_, attrit_present, couple_, one_kids, two_kids, distance_6eme_recent, # attrition
+                   both_parents_french, one_parent_french,  # variables at 16
+                   late_school, occup_father_0, occup_father_1,
+                   occup_father_2, occup_mother_0, occup_mother_1,
+                   occup_mother_2)]
+
+# # data = data[id==1]
+# # imin=imax=1
+n=length(unique(data$id))
+imin=1
+imax=n
+data[,id := as.factor(id)]
+
+# data = data[id==4]
+# data[,id:=1]
+
+
+
+# Fix parameters
+discount = 0.95
+euler = 0.5772156649
+
+
+param_schooling = c("urban","more_eighteen", "more_twenty")
+nb_schooling = length(param_schooling)
+
+param_work = c("urban","g_", "expe_", "expe_2")
+nb_work = length(param_work)
+
+param_home = c("age","age*age")
+nb_home = length(param_home)
+
+param_initial = c("both_parents_french", "one_parent_french", "late_school", 
+                  "occup_father_1", "occup_father_2", 
+                  "occup_mother_1", "occup_mother_2", "constant")
+nb_initial = length(param_initial)
+
+types = 2*3
+distribution = 1 + 1 
+nb_vip = types+distribution
+
+n_params = nb_vip + nb_schooling + nb_work + nb_home + nb_initial
+
+param = c(0.300 ,1.75, -1.06,
+          0.300 ,1.75, -1.06,
+          0, 4, # distributions parameters
+          -1.76,  -1.48, 0.278, # schooling: 18, 20, urban
+          0.051, 0.057, -0.002, .075, # wage: g_, expe_, expe^2, urban
+          0.08, -0.005, # home: age, age^2
+          -0.144,0.0260,-0.317,-0.132,0.078,-0.129,0.007, 1
+) 
+
+
+
 complete_likelihood = function(param, imin, imax, data){
   
   alpha_1_1 = param[1]
@@ -661,3 +731,67 @@ complete_likelihood = function(param, imin, imax, data){
   
   
 } # close function
+
+# Likelihood function chunks -----------------------------------------------------
+
+likelihood_chunks =  function(param){
+  
+  
+  
+  likelihood_sample = foreach (j = 1:no_chunk, .combine="+")  %dopar%{ ### start loop for each chunk
+    
+    imin=1+(j-1)*no_i_by_chunk
+    imax=min(n,j*no_i_by_chunk)
+    data_i_chunk = data[id %between% c(as.numeric(imin), as.numeric(imax))]
+    data_i_chunk[,id := as.factor(id)]
+    contribution_chunk =  complete_likelihood(param, imin, imax, data_i_chunk)
+    
+  }
+  
+  
+  
+  p = likelihood_sample
+  
+  return(p)
+  
+}
+
+
+
+
+#Optimization of the code
+data[,id := as.numeric(id)]
+#anubis
+source("/softs/R/createCluster.R")
+cl<-createCluster() 
+# CPU
+# cl<-createCluster(7)
+no_chunk=14
+no_i_by_chunk=ceiling((n+1)/no_chunk)
+registerDoParallel(cl)
+clusterExport(cl, list("data", "discount", "euler", "distribution",
+                       "n_params", "nb_schooling", "nb_work", "nb_home", "nb_initial", "nb_vip",
+                       "n", "no_i_by_chunk",  
+                       "param", "no_chunk", "complete_likelihood"))
+clusterEvalQ(cl,library("numDeriv"))
+clusterEvalQ(cl,library("data.table"))
+clusterEvalQ(cl,library("tidyverse"))
+clusterEvalQ(cl,library("ucminf"))
+clusterEvalQ(cl,library("optimx"))
+clusterEvalQ(cl,library("spatstat"))
+clusterEvalQ(cl,library("Brobdingnag"))
+
+
+a = Sys.time()
+results = ucminf(param, likelihood_chunks, hessian = 3, control = list(trace=5, grtol = 1e-10))
+inv_hessian = solve(results$hessian*n)
+standard_errors <- sqrt(diag(inv_hessian))
+results$par
+results$convergence
+warnings()
+b = Sys.time()
+b
+est <- data.table(beta = results$par, stder = standard_errors, p_value = 2*pnorm(-abs(results$par/standard_errors)))
+est
+stopCluster(cl)
+
